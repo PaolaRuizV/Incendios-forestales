@@ -433,7 +433,7 @@ with tab_tecnico:
 
     st.subheader("Horizontes considerados")
     st.code(f"core.HORIZONS = {core.HORIZONS}")
-    st.write("El horizonte de 72h no se entrena, no se evalúa y no aparece en el CSV final.")
+
 
     st.subheader("Validez y positivos por horizonte")
     horizon_df = pd.DataFrame({
