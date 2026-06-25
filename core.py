@@ -1,452 +1,391 @@
 """
-core.py
-Logica de datos y modelos para el dashboard de Prediccion de Amenaza de
-Incendios Forestales. Separado de la interfaz de Streamlit para poder probarlo
-independientemente.
+core.py - Nucleo compartido del proyecto de prediccion de amenaza de incendios.
 
-Correcciones principales:
-1) El formulario ahora expone mas variables para que exista mayor variacion.
-2) Se recalculan variables derivadas cuando cambia una variable base.
-3) La lectura de archivos acepta bytes, objetos UploadedFile o rutas locales.
-4) Se mantiene excluida 'dist_min_ci_0_5h' para evitar fuga de datos.
+UNICA FUENTE DE VERDAD: tanto el notebook como la app de Streamlit importan este
+archivo. Asi es imposible que difieran en features, ingenieria de variables,
+modelos (LightGBM + XGBoost + CatBoost), construccion de objetivos o metrica.
+
+Para usarlo en Colab: sube core.py junto al notebook y el notebook hace `import core`.
+Para la app: app.py hace `import core`.
 """
-
 import io
 import os
+import warnings
 import numpy as np
 import pandas as pd
 
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
+from sklearn.model_selection import StratifiedKFold
+from sklearn.isotonic import IsotonicRegression
+from lightgbm import LGBMClassifier
+import lightgbm as lgb
+from xgboost import XGBClassifier
+
+try:
+    from catboost import CatBoostClassifier, Pool
+    HAS_CATBOOST = True
+except ImportError:
+    HAS_CATBOOST = False
+
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
 
 # ---------------------------------------------------------------------------
-# Esquema de datos
+# Configuracion (identica al notebook)
 # ---------------------------------------------------------------------------
+SEED = 42
+N_FOLDS = 3
+HORIZONS = [12, 24, 48]          # Horizontes de prediccion (horas). 72h retirado del analisis
+EVAL_HORIZONS = [24, 48]        # Horizontes usados en la metrica principal
+CORE_VERSION = "streamlit_sin_72h_fast"
+USE_GPU = False                  # CPU: evita fallos silenciosos sin GPU
+
 ID_COL = "event_id"
-TARGET = "event"                 # 1 = el incendio alcanzo una zona de evacuacion
-TIME_COL = "time_to_hit_hours"   # horas hasta el impacto, solo para analisis
-
-# Caracteristicas del incendio.
-FEATURES = [
-    "num_perimeters_0_5h", "dt_first_last_0_5h", "low_temporal_resolution_0_5h",
-    "area_first_ha", "area_growth_abs_0_5h", "area_growth_rel_0_5h",
-    "area_growth_rate_ha_per_h", "log1p_area_first", "log1p_growth",
-    "log_area_ratio_0_5h", "relative_growth_0_5h", "radial_growth_m",
-    "radial_growth_rate_m_per_h", "centroid_displacement_m", "centroid_speed_m_per_h",
-    "spread_bearing_deg", "spread_bearing_sin", "spread_bearing_cos",
-    "dist_min_ci_0_5h", "dist_std_ci_0_5h", "dist_change_ci_0_5h",
-    "dist_slope_ci_0_5h", "closing_speed_m_per_h", "closing_speed_abs_m_per_h",
-    "projected_advance_m", "dist_accel_m_per_h2", "dist_fit_r2_0_5h",
-    "alignment_cos", "alignment_abs", "cross_track_component", "along_track_speed",
-    "event_start_hour", "event_start_dayofweek", "event_start_month",
-]
-
-# Variables con sospecha de fuga de datos.
-# IMPORTANTE:
-# 'dist_min_ci_0_5h' puede separar muy fuerte las clases. Si la usas, las metricas
-# pueden salir artificialmente altas. Por eso se excluye del entrenamiento.
-# Si el profesor permite usarla, cambia a: LEAKAGE_SUSPECTS = []
-LEAKAGE_SUSPECTS = ["dist_min_ci_0_5h"]
-
-# Variables que se muestran en el formulario individual.
-# Se agregaron mas campos para que la prediccion cambie con mayor claridad.
-FORM_FEATURES = [
-    ("area_first_ha", "Area inicial del incendio (ha)"),
-    ("area_growth_abs_0_5h", "Crecimiento absoluto de area 0-5 h (ha)"),
-    ("area_growth_rate_ha_per_h", "Tasa de crecimiento de area (ha/h)"),
-    ("radial_growth_m", "Crecimiento radial acumulado (m)"),
-    ("radial_growth_rate_m_per_h", "Velocidad de avance radial (m/h)"),
-    ("centroid_displacement_m", "Desplazamiento del centroide (m)"),
-    ("centroid_speed_m_per_h", "Velocidad del centroide (m/h)"),
-    ("projected_advance_m", "Avance proyectado hacia la zona (m)"),
-    ("closing_speed_m_per_h", "Velocidad de acercamiento a la zona (m/h)"),
-    ("dist_change_ci_0_5h", "Cambio de distancia a la zona 0-5 h (m)"),
-    ("dist_slope_ci_0_5h", "Pendiente de distancia a la zona (m/h)"),
-    ("dist_accel_m_per_h2", "Aceleracion de distancia (m/h2)"),
-    ("dist_fit_r2_0_5h", "Calidad del ajuste de distancia R2"),
-    ("alignment_cos", "Alineacion del avance hacia la zona (-1 a 1)"),
-    ("cross_track_component", "Componente transversal del avance"),
-    ("along_track_speed", "Velocidad en direccion de avance"),
-    ("num_perimeters_0_5h", "Cantidad de perimetros 0-5 h"),
-    ("dt_first_last_0_5h", "Tiempo entre primer y ultimo perimetro (h)"),
-    ("low_temporal_resolution_0_5h", "Baja resolucion temporal 0-5 h"),
-    ("spread_bearing_sin", "Direccion del avance - seno"),
-    ("spread_bearing_cos", "Direccion del avance - coseno"),
-    ("event_start_hour", "Hora de inicio del evento (0-23)"),
-    ("event_start_dayofweek", "Dia de la semana (0-6)"),
-    ("event_start_month", "Mes de inicio (1-12)"),
-]
-
-LOCAL_CANDIDATES = [
-    "data/train.csv",
-    "train.csv",
-]
+TARGET = "event"
+TIME_COL = "time_to_hit_hours"
 
 LABELS_TARGET = {
     0: "No alcanzo la zona de evacuacion",
     1: "Alcanzo / en riesgo de alcanzar la zona",
 }
 
+# Caracteristicas crudas que el usuario puede ajustar en el formulario de la app.
+# El resto se completan con la mediana de entrenamiento y TODAS las derivadas se
+# recalculan con engineer_features() despues de aplicar estos valores.
+FORM_FEATURES = [
+    ("dist_min_ci_0_5h", "Distancia minima a la zona de evacuacion (m)"),
+    ("closing_speed_m_per_h", "Velocidad de acercamiento a la zona (m/h)"),
+    ("area_first_ha", "Area inicial del incendio (ha)"),
+    ("area_growth_rate_ha_per_h", "Tasa de crecimiento de area (ha/h)"),
+    ("alignment_abs", "Alineacion del avance hacia la zona (0 a 1)"),
+    ("num_perimeters_0_5h", "Numero de perimetros observados"),
+    ("radial_growth_rate_m_per_h", "Velocidad de avance radial (m/h)"),
+    ("event_start_hour", "Hora de inicio del evento (0-23)"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Ingenieria de variables (copia exacta del notebook)
+# ---------------------------------------------------------------------------
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Crea caracteristicas basadas en fisica para prediccion de incendios."""
+    out = df.copy()
+    distance = out["dist_min_ci_0_5h"].clip(lower=1)
+    speed = out["closing_speed_m_per_h"]
+
+    out["time_to_contact"] = distance / speed.clip(lower=0.01)
+    out["log_time_to_contact"] = np.log1p(out["time_to_contact"].clip(0, 5000))
+    out["danger_vector"] = out["alignment_abs"] * speed
+    out["tracking_urgency"] = out["num_perimeters_0_5h"] * speed
+    out["fire_intensity"] = out["area_growth_rate_ha_per_h"] * out["num_perimeters_0_5h"]
+    out["approach_momentum"] = speed * out["alignment_abs"] / np.log1p(distance)
+    out["log_dist"] = np.log1p(distance)
+    out["dist_zone_critical"] = (distance < 5000).astype(np.float32)
+    out["dist_zone_mid"] = ((distance >= 5000) & (distance < 15000)).astype(np.float32)
+    out["speed_per_km"] = speed / (distance / 1000).clip(lower=0.1)
+
+    out = out.replace([np.inf, -np.inf], np.nan).fillna(0)
+    return out
+
+
+def get_feature_cols(df_fe: pd.DataFrame):
+    return [c for c in df_fe.columns if c not in [ID_COL, TARGET, TIME_COL]]
+
+
+# ---------------------------------------------------------------------------
+# Objetivos de supervivencia con manejo de censura (copia exacta)
+# ---------------------------------------------------------------------------
+def build_survival_targets(time_values, event_values, horizons):
+    targets, masks = {}, {}
+    for H in horizons:
+        unknown = (event_values == 0) & (time_values < H)
+        y = ((event_values == 1) & (time_values <= H)).astype(np.float64)
+        y[unknown] = np.nan
+        targets[H] = y
+        masks[H] = ~unknown
+    return targets, masks
+
+
+# ---------------------------------------------------------------------------
+# Parametros de los modelos (identicos al notebook)
+# ---------------------------------------------------------------------------
+def get_model_params():
+    lgb_params = dict(
+        objective="binary", learning_rate=0.035, num_leaves=15, max_depth=3,
+        min_child_samples=25, subsample=0.80, colsample_bytree=0.70,
+        reg_alpha=0.1, reg_lambda=1.0, n_estimators=100, random_state=SEED,
+        verbose=-1, n_jobs=1, force_col_wise=True,
+    )
+    xgb_params = dict(
+        objective="binary:logistic", learning_rate=0.035, max_depth=3,
+        min_child_weight=25, subsample=0.80, colsample_bytree=0.70,
+        reg_alpha=0.1, reg_lambda=1.0, n_estimators=100, random_state=SEED,
+        verbosity=0, n_jobs=1,
+        tree_method="gpu_hist" if USE_GPU else "hist", eval_metric="logloss",
+    )
+    cat_params = dict(
+        iterations=100, learning_rate=0.035, depth=3, l2_leaf_reg=3.0,
+        random_seed=SEED, verbose=0,
+        task_type="GPU" if USE_GPU else "CPU", eval_metric="Logloss",
+    )
+    if USE_GPU:
+        lgb_params["device"] = "gpu"
+    return lgb_params, xgb_params, cat_params
+
+
+def _fit_horizon_models(Xtr, ytr, Xva=None, yva=None):
+    """Entrena el ensamble (LGB + XGB + CatBoost) para un horizonte. Sin except: pass."""
+    lgb_params, xgb_params, cat_params = get_model_params()
+    models = []
+
+    m_lgb = LGBMClassifier(**lgb_params)
+    if Xva is not None:
+        m_lgb.fit(Xtr, ytr, eval_set=[(Xva, yva)],
+                  callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)])
+    else:
+        m_lgb.fit(Xtr, ytr)
+    models.append(m_lgb)
+
+    m_xgb = XGBClassifier(**xgb_params)
+    if Xva is not None:
+        m_xgb.fit(Xtr, ytr, eval_set=[(Xva, yva)], verbose=False)
+    else:
+        m_xgb.fit(Xtr, ytr)
+    models.append(m_xgb)
+
+    if HAS_CATBOOST:
+        m_cat = CatBoostClassifier(**cat_params)
+        if Xva is not None:
+            m_cat.fit(Pool(Xtr, ytr), eval_set=Pool(Xva, yva), early_stopping_rounds=50)
+        else:
+            m_cat.fit(Pool(Xtr, ytr))
+        models.append(m_cat)
+
+    return models
+
+
+def _predict_ensemble(models, X):
+    """Promedia predict_proba de los modelos del horizonte."""
+    preds = np.zeros(len(X))
+    for m in models:
+        preds += m.predict_proba(X)[:, 1]
+    return preds / len(models)
+
+
+# ---------------------------------------------------------------------------
+# Metrica principal: C-Index + Brier ponderado solo sobre 24h y 48h
+# ---------------------------------------------------------------------------
+def c_index(time, event, risk):
+    n = 0
+    concordant = 0.0
+    for i in range(len(time)):
+        for j in range(len(time)):
+            if event[i] == 1 and time[i] < time[j]:
+                n += 1
+                if risk[i] > risk[j]:
+                    concordant += 1
+                elif risk[i] == risk[j]:
+                    concordant += 0.5
+    return concordant / n if n > 0 else 0.5
+
+
+def brier_at(time, event, prob, H):
+    valid = ~((event == 0) & (time < H))
+    if valid.sum() == 0:
+        return 0.0
+    y = ((event == 1) & (time <= H)).astype(float)[valid]
+    p = np.asarray(prob)[valid]
+    return float(np.mean((p - y) ** 2))
+
+
+def hybrid_score(time, event, p24, p48, risk=None):
+    """
+    Hibrido = 0.3*C-Index + 0.7*(1 - Brier Ponderado).
+    Se calcula solo sobre 24h y 48h. El horizonte 72h no se usa.
+    """
+    w24, w48 = 0.3 / 0.7, 0.4 / 0.7
+    if risk is None:
+        risk = w24 * p24 + w48 * p48
+    ci = c_index(time, event, risk)
+    b24 = brier_at(time, event, p24, 24)
+    b48 = brier_at(time, event, p48, 48)
+    weighted_brier = w24 * b24 + w48 * b48
+    hybrid = 0.3 * ci + 0.7 * (1 - weighted_brier)
+    return hybrid, ci, weighted_brier
+
+
+def enforce_monotonicity(probs):
+    out = np.clip(probs.copy(), 0, 1)
+    for i in range(1, out.shape[1]):
+        out[:, i] = np.maximum(out[:, i], out[:, i - 1])
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Carga de datos
 # ---------------------------------------------------------------------------
-def _read_csv_flexible(source) -> pd.DataFrame:
-    """Lee un CSV detectando separador: coma, punto y coma o tabulacion."""
+def _read_csv_flexible(source):
     return pd.read_csv(source, sep=None, engine="python")
 
 
-def _source_to_dataframe(source) -> pd.DataFrame:
-    """
-    Convierte diferentes tipos de entrada a DataFrame.
-    Acepta:
-    - bytes, por ejemplo uploaded_file.getvalue()
-    - objetos con .read(), por ejemplo UploadedFile de Streamlit
-    - rutas locales como string
-    """
-    if isinstance(source, (bytes, bytearray)):
-        text = bytes(source).decode("utf-8")
-        return _read_csv_flexible(io.StringIO(text))
-
-    if hasattr(source, "read"):
-        raw = source.read()
-        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
-        return _read_csv_flexible(io.StringIO(text))
-
-    return _read_csv_flexible(source)
-
-
-def load_data(uploaded_file=None) -> pd.DataFrame:
-    """
-    Orden de busqueda del dataset de entrenamiento:
-    1) archivo subido por el usuario en Streamlit
-    2) data/train.csv
-    3) train.csv
-    """
+def load_data(uploaded_file=None, candidates=("data/train.csv", "train.csv")):
     if uploaded_file is not None:
-        df = _source_to_dataframe(uploaded_file)
+        raw = uploaded_file.read()
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        df = _read_csv_flexible(io.StringIO(text))
     else:
         df = None
-        for path in LOCAL_CANDIDATES:
+        for path in candidates:
             if os.path.exists(path):
                 df = _read_csv_flexible(path)
                 break
-
         if df is None:
-            raise FileNotFoundError(
-                "No se encontro train.csv. Subelo en la barra lateral o "
-                "incluyelo en la carpeta data/ del repositorio."
-            )
-
+            raise FileNotFoundError("No se encontro train.csv.")
     if TARGET not in df.columns:
-        raise ValueError(
-            f"El archivo cargado no contiene la columna objetivo '{TARGET}'. "
-            "Asegurate de subir el conjunto de ENTRENAMIENTO, no el test.csv. "
-            f"Columnas detectadas: {list(df.columns)}"
-        )
-
+        raise ValueError(f"Falta la columna objetivo '{TARGET}'. Sube el conjunto de "
+                         f"entrenamiento. Columnas: {list(df.columns)}")
     return df
 
 
-def read_prediction_file(uploaded_file) -> pd.DataFrame:
-    """Lee un CSV, TXT o Excel de casos a predecir, como test.csv."""
+def read_prediction_file(uploaded_file):
     name = getattr(uploaded_file, "name", "").lower()
-
     if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(uploaded_file)
-
-    if hasattr(uploaded_file, "read"):
-        raw = uploaded_file.read()
-    else:
-        raw = uploaded_file
-
-    text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+    raw = uploaded_file.read()
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
     return _read_csv_flexible(io.StringIO(text))
 
 
 # ---------------------------------------------------------------------------
-# Preprocesamiento y modelos
+# Entrenamiento con validacion cruzada (FUENTE UNICA para metricas Y predicciones)
+# Replica exactamente el notebook: promedia los modelos de los N_FOLDS pliegues.
 # ---------------------------------------------------------------------------
-def build_preprocessor() -> Pipeline:
-    """Imputacion por mediana + estandarizacion."""
-    return Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
+def fit_cv(df: pd.DataFrame):
+    """
+    Entrena el ensamble con validacion cruzada estratificada optimizada para web. Guarda TODOS los
+    modelos de todos los pliegues por horizonte, de modo que la prediccion (en la
+    app o para predicciones.csv) sea el promedio sobre pliegues y modelos,
+    identico a `test_preds` del notebook.
+    """
+    train_fe = engineer_features(df)
+    feature_cols = get_feature_cols(train_fe)
+    X = train_fe[feature_cols].values.astype(np.float32)
+    time_arr = train_fe[TIME_COL].values
+    event_arr = train_fe[TARGET].values.astype(int)
+    targets, masks = build_survival_targets(time_arr, event_arr, HORIZONS)
 
+    cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    strat = ((event_arr == 1) & (time_arr <= 24)).astype(int)
 
-def get_model_definitions():
-    """Define los cinco modelos que se comparan en el dashboard."""
+    # Modelos almacenados por horizonte (lista de todos los modelos de todos los pliegues)
+    horizon_models = {H: [] for H in HORIZONS}
+    horizon_constant = {H: None for H in HORIZONS}
+    oof = np.full((len(df), len(HORIZONS)), np.nan)
+    fold_scores = []
+
+    # Posiciones de 24h y 48h dentro de HORIZONS.
+    # Esto evita errores si se retiró 72h y ya no existe la columna índice 3.
+    h_idx = {H: i for i, H in enumerate(HORIZONS)}
+    idx24 = h_idx[24]
+    idx48 = h_idx[48]
+
+    for tr_idx, va_idx in cv.split(X, strat):
+        for h_i, H in enumerate(HORIZONS):
+            y = targets[H]
+            ytr_full, yva_full = y[tr_idx], y[va_idx]
+            tr_ok, va_ok = ~np.isnan(ytr_full), ~np.isnan(yva_full)
+
+            if tr_ok.sum() < 5 or va_ok.sum() < 3:
+                oof[va_idx, h_i] = np.nanmean(y[~np.isnan(y)])
+                continue
+
+            Xtr, ytr = X[tr_idx][tr_ok], ytr_full[tr_ok]
+            Xva, yva = X[va_idx][va_ok], yva_full[va_ok]
+
+            if len(np.unique(ytr)) < 2:
+                # Horizonte con una sola clase -> predictor constante
+                horizon_constant[H] = float(np.unique(ytr)[0])
+                oof[va_idx, h_i] = horizon_constant[H]
+                continue
+
+            models = _fit_horizon_models(Xtr, ytr, Xva, yva)
+            horizon_models[H].extend(models)
+            oof[va_idx, h_i] = _predict_ensemble(models, X[va_idx])
+
+        oof[va_idx] = enforce_monotonicity(oof[va_idx])
+        s, _, _ = hybrid_score(time_arr[va_idx], event_arr[va_idx],
+                               oof[va_idx, idx24], oof[va_idx, idx48])
+        fold_scores.append(s)
+
+    score, ci, wb = hybrid_score(time_arr, event_arr, oof[:, idx24], oof[:, idx48])
+    metrics = {
+        "hybrid": score, "c_index": ci, "weighted_brier": wb,
+        "fold_scores": fold_scores,
+        "brier_12h": brier_at(time_arr, event_arr, oof[:, 0], 12),
+        "brier_24h": brier_at(time_arr, event_arr, oof[:, idx24], 24),
+        "brier_48h": brier_at(time_arr, event_arr, oof[:, idx48], 48),
+        "oof": oof, "time_arr": time_arr, "event_arr": event_arr,
+        "horizon_valid": {H: int(masks[H].sum()) for H in HORIZONS},
+        "horizon_pos": {H: int(np.nansum(targets[H])) for H in HORIZONS},
+    }
+
     return {
-        "Regresion Logistica": LogisticRegression(
-            max_iter=1000,
-            random_state=42,
-            class_weight="balanced",
-        ),
-        "Arbol de Decision": DecisionTreeClassifier(
-            max_depth=5,
-            random_state=42,
-            class_weight="balanced",
-        ),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=200,
-            max_depth=6,
-            random_state=42,
-            class_weight="balanced",
-        ),
-        "Gradient Boosting": GradientBoostingClassifier(
-            random_state=42,
-        ),
-        "KNN": KNeighborsClassifier(
-            n_neighbors=7,
-        ),
+        "horizon_models": horizon_models,
+        "horizon_constant": horizon_constant,
+        "feature_cols": feature_cols,
+        "medians": train_fe[feature_cols].median(numeric_only=True),
+        "raw_medians": df.median(numeric_only=True),
+        "train_fe": train_fe,
+        "metrics": metrics,
     }
 
 
-def train_and_evaluate(df: pd.DataFrame):
-    """
-    Entrena 5 modelos y devuelve:
-    - pipelines entrenados
-    - tabla de metricas
-    - nombre del mejor modelo
-    - medianas del entrenamiento
-    - columnas usadas
-    - conjunto de prueba
-    """
-    present = [
-        c for c in FEATURES
-        if c in df.columns and c not in LEAKAGE_SUSPECTS
-    ]
-
-    if not present:
-        raise ValueError("No se encontraron columnas de caracteristicas validas.")
-
-    X = df[present].apply(pd.to_numeric, errors="coerce")
-    y = df[TARGET].astype(int)
-
-    # Stratify mantiene la proporcion de clases en train y test.
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.20,
-        random_state=42,
-        stratify=y,
-    )
-
-    medians = X_train.median(numeric_only=True)
-    model_defs = get_model_definitions()
-
-    pipelines = {}
-    rows = []
-
-    for name, estimator in model_defs.items():
-        pipe = Pipeline(steps=[
-            ("preprocessor", build_preprocessor()),
-            ("model", estimator),
-        ])
-
-        pipe.fit(X_train, y_train)
-        y_pred = pipe.predict(X_test)
-
-        try:
-            y_proba = pipe.predict_proba(X_test)[:, 1]
-            auc = roc_auc_score(y_test, y_proba)
-        except Exception:
-            auc = np.nan
-
-        rows.append({
-            "Modelo": name,
-            "Accuracy": accuracy_score(y_test, y_pred),
-            "F1-Score": f1_score(y_test, y_pred, zero_division=0),
-            "Precision": precision_score(y_test, y_pred, zero_division=0),
-            "Recall": recall_score(y_test, y_pred, zero_division=0),
-            "ROC-AUC": auc,
-        })
-
-        pipelines[name] = pipe
-
-    metrics_df = (
-        pd.DataFrame(rows)
-        .sort_values("F1-Score", ascending=False)
-        .reset_index(drop=True)
-    )
-
-    best_name = metrics_df.iloc[0]["Modelo"]
-    return pipelines, metrics_df, best_name, medians, present, (X_test, y_test)
-
-
-# ---------------------------------------------------------------------------
-# Prediccion
-# ---------------------------------------------------------------------------
-def _safe_float(value, default=0.0):
-    """Convierte a float evitando errores por valores vacios o no numericos."""
-    try:
-        if value is None or pd.isna(value):
-            return float(default)
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def _recalculate_derived_features(row: dict) -> dict:
-    """
-    Recalcula variables derivadas para que el formulario sea coherente.
-    Sin esto, el usuario cambiaba una variable base, pero sus variables derivadas
-    quedaban congeladas con la mediana y la prediccion variaba poco.
-    """
-
-    # Transformaciones logaritmicas.
-    if "area_first_ha" in row and "log1p_area_first" in row:
-        row["log1p_area_first"] = float(np.log1p(max(row["area_first_ha"], 0)))
-
-    if "area_growth_abs_0_5h" in row and "log1p_growth" in row:
-        row["log1p_growth"] = float(np.log1p(max(row["area_growth_abs_0_5h"], 0)))
-
-    # Si existen area inicial y crecimiento absoluto, recalcula crecimiento relativo.
-    if (
-        "area_first_ha" in row
-        and "area_growth_abs_0_5h" in row
-        and "area_growth_rel_0_5h" in row
-    ):
-        base = max(abs(row["area_first_ha"]), 1e-6)
-        row["area_growth_rel_0_5h"] = row["area_growth_abs_0_5h"] / base
-
-    if (
-        "area_growth_rel_0_5h" in row
-        and "relative_growth_0_5h" in row
-    ):
-        row["relative_growth_0_5h"] = row["area_growth_rel_0_5h"]
-
-    if (
-        "area_growth_rel_0_5h" in row
-        and "log_area_ratio_0_5h" in row
-    ):
-        # log(1 + crecimiento relativo), acotado para evitar log de negativo.
-        ratio = max(1.0 + row["area_growth_rel_0_5h"], 1e-6)
-        row["log_area_ratio_0_5h"] = float(np.log(ratio))
-
-    # Valores absolutos derivados.
-    if "alignment_cos" in row and "alignment_abs" in row:
-        row["alignment_abs"] = abs(row["alignment_cos"])
-
-    if "closing_speed_m_per_h" in row and "closing_speed_abs_m_per_h" in row:
-        row["closing_speed_abs_m_per_h"] = abs(row["closing_speed_m_per_h"])
-
-    # Tasas derivadas si el tiempo esta disponible.
-    if (
-        "area_growth_abs_0_5h" in row
-        and "dt_first_last_0_5h" in row
-        and "area_growth_rate_ha_per_h" in row
-        and row["dt_first_last_0_5h"] > 0
-    ):
-        row["area_growth_rate_ha_per_h"] = (
-            row["area_growth_abs_0_5h"] / row["dt_first_last_0_5h"]
-        )
-
-    if (
-        "radial_growth_m" in row
-        and "dt_first_last_0_5h" in row
-        and "radial_growth_rate_m_per_h" in row
-        and row["dt_first_last_0_5h"] > 0
-    ):
-        row["radial_growth_rate_m_per_h"] = (
-            row["radial_growth_m"] / row["dt_first_last_0_5h"]
-        )
-
-    if (
-        "centroid_displacement_m" in row
-        and "dt_first_last_0_5h" in row
-        and "centroid_speed_m_per_h" in row
-        and row["dt_first_last_0_5h"] > 0
-    ):
-        row["centroid_speed_m_per_h"] = (
-            row["centroid_displacement_m"] / row["dt_first_last_0_5h"]
-        )
-
-    return row
-
-
-def _row_from_form(form_values: dict, medians: pd.Series, present_features):
-    """
-    Construye una fila completa para prediccion individual.
-    Empieza con medianas y reemplaza con los valores ingresados por el usuario.
-    """
-    row = {
-        feat: _safe_float(medians.get(feat, 0.0), 0.0)
-        for feat in present_features
-    }
-
-    for feat, val in form_values.items():
-        if feat in row:
-            row[feat] = _safe_float(val, row[feat])
-
-    row = _recalculate_derived_features(row)
-    return pd.DataFrame([row])[present_features]
-
-
-def predict_single(pipeline, form_values: dict, medians: pd.Series, present_features):
-    """Predice un caso individual ingresado desde el formulario."""
-    X_new = _row_from_form(form_values, medians, present_features)
-    pred = int(pipeline.predict(X_new)[0])
-    proba = pipeline.predict_proba(X_new)[0]
-    return pred, float(proba[1]), float(proba[0])
-
-
-def predict_batch(pipeline, df_new: pd.DataFrame, medians: pd.Series, present_features):
-    """
-    Predice un archivo por lote.
-    Si faltan columnas, las completa con la mediana del entrenamiento.
-    """
-    X = pd.DataFrame(index=df_new.index)
-
-    for feat in present_features:
-        if feat in df_new.columns:
-            X[feat] = pd.to_numeric(df_new[feat], errors="coerce")
+def _predict_rows(bundle, df_fe_rows):
+    feature_cols = bundle["feature_cols"]
+    X = df_fe_rows[feature_cols].values.astype(np.float32)
+    out = np.zeros((len(X), len(HORIZONS)))
+    for h_i, H in enumerate(HORIZONS):
+        models = bundle["horizon_models"][H]
+        if not models:  # horizonte constante si no hay dos clases suficientes
+            out[:, h_i] = bundle["horizon_constant"][H] if bundle["horizon_constant"][H] is not None else 1.0
         else:
-            X[feat] = float(medians.get(feat, 0.0))
+            preds = np.zeros(len(X))
+            for m in models:
+                preds += m.predict_proba(X)[:, 1]
+            out[:, h_i] = preds / len(models)
+    return enforce_monotonicity(out)
 
-    X = X[present_features]
 
-    proba = pipeline.predict_proba(X)[:, 1]
-    pred = pipeline.predict(X).astype(int)
+def predict_batch(model_bundle, df_new: pd.DataFrame):
+    """Predice prob_12h/24h/48h para un lote tipo test.csv."""
+    df_fe = engineer_features(df_new)
+    # Completar columnas faltantes con la mediana cruda antes de la ingenieria
+    for col in model_bundle["raw_medians"].index:
+        if col not in df_fe.columns:
+            df_fe[col] = float(model_bundle["raw_medians"][col])
+    probs = _predict_rows(model_bundle, df_fe)
 
     out = pd.DataFrame()
     if ID_COL in df_new.columns:
         out[ID_COL] = df_new[ID_COL].values
-
-    out["prob_alcanza_zona"] = np.round(proba, 4)
-    out["prediccion"] = pred
-    out["diagnostico"] = pd.Series(pred).map(LABELS_TARGET).values
-
+    for h_i, H in enumerate(HORIZONS):
+        out[f"prob_{H}h"] = np.round(probs[:, h_i], 6)
     return out
 
 
-def feature_importance(pipeline, present_features) -> pd.DataFrame | None:
-    """Devuelve importancia de caracteristicas si el modelo la soporta."""
-    model = pipeline.named_steps.get("model")
+def predict_single(model_bundle, form_values: dict):
+    """
+    Construye una fila cruda (medianas + valores del formulario), RECALCULA las
+    variables derivadas con engineer_features y predice los 3 horizontes.
+    Devuelve (probs_dict, fila_enviada_al_modelo).
+    """
+    raw = {c: float(model_bundle["raw_medians"].get(c, 0.0))
+           for c in model_bundle["raw_medians"].index}
+    for feat, val in form_values.items():
+        raw[feat] = float(val)
+    df_raw = pd.DataFrame([raw])
+    df_fe = engineer_features(df_raw)
+    probs = _predict_rows(model_bundle, df_fe)[0]
+    probs_dict = {H: float(probs[h_i]) for h_i, H in enumerate(HORIZONS)}
+    fila = df_fe[model_bundle["feature_cols"]].T
+    return probs_dict, fila
 
-    if hasattr(model, "feature_importances_"):
-        imp = model.feature_importances_
-    elif hasattr(model, "coef_"):
-        imp = np.abs(model.coef_).ravel()
-    else:
-        return None
-
-    return (
-        pd.DataFrame({"Caracteristica": present_features, "Importancia": imp})
-        .sort_values("Importancia", ascending=False)
-        .reset_index(drop=True)
-    )
