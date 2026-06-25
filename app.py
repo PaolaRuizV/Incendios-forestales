@@ -85,7 +85,7 @@ def probability_level(prob: float) -> tuple[str, str]:
 # Sidebar
 # -----------------------------------------------------------------------------
 st.sidebar.title("🔥 Incendios forestales")
-st.sidebar.caption("Versión web del modelo WiDS sin horizonte de 72h.")
+st.sidebar.caption("Versión web del modelo")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Fuente de datos")
