@@ -1,441 +1,484 @@
 """
-app.py - Dashboard interactivo de Prediccion de Amenaza de Incendios Forestales
+app.py - Versión web Streamlit del proyecto.
 
-Panel A: Analisis de Datos, con filtros y KPIs.
-Panel B: Analisis Predictivo, con formulario individual y prediccion por lote.
-
-Para correr localmente:
-    streamlit run app.py
-
-Para desplegar en Streamlit Community Cloud:
-    1) Sube app.py, core.py, requirements.txt y data/train.csv al repositorio.
-    2) En Streamlit Community Cloud selecciona app.py como archivo principal.
+Predice probabilidades de amenaza de incendios forestales para 12h, 24h y 48h.
+El núcleo del modelo está en core.py para mantener la misma lógica del notebook.
 """
 
-import streamlit as st
+from __future__ import annotations
+
+import io
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
 
 import core
 
+# -----------------------------------------------------------------------------
+# Configuración general
+# -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Incendios Forestales - Dashboard",
+    page_title="Amenaza de incendios forestales",
     page_icon="🔥",
     layout="wide",
 )
 
-
-# ---------------------------------------------------------------------------
-# Cache
-# ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Cargando dataset de incendios...")
-def get_data(uploaded_bytes=None):
-    """Carga el dataset de entrenamiento. Se usan bytes para evitar errores de cache."""
-    return core.load_data(uploaded_bytes)
-
-
-@st.cache_resource(show_spinner="Entrenando y comparando 5 modelos...")
-def get_models(df: pd.DataFrame):
-    """Entrena modelos y guarda el resultado en cache."""
-    return core.train_and_evaluate(df)
-
-
 COLOR_MAP = {
-    core.LABELS_TARGET[0]: "#2E86AB",   # azul = no alcanzo
-    core.LABELS_TARGET[1]: "#E63946",   # rojo = alcanzo / en riesgo
+    0: "#2E86AB",
+    1: "#E63946",
+    "No alcanzo la zona de evacuacion": "#2E86AB",
+    "Alcanzo / en riesgo de alcanzar la zona": "#E63946",
 }
 
+HORIZON_LABELS = {12: "12 horas", 24: "24 horas", 48: "48 horas"}
 
-# ---------------------------------------------------------------------------
-# Sidebar: fuente de datos
-# ---------------------------------------------------------------------------
-st.sidebar.title("🔥 Incendios Forestales")
+
+# -----------------------------------------------------------------------------
+# Utilidades de carga y entrenamiento
+# -----------------------------------------------------------------------------
+def _read_csv_flexible_from_bytes(raw: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
+
+
+@st.cache_data(show_spinner="Cargando dataset de entrenamiento...")
+def load_train_data(uploaded_bytes: bytes | None) -> pd.DataFrame:
+    """Carga train.csv subido o el incluido en data/train.csv."""
+    if uploaded_bytes is not None:
+        df = _read_csv_flexible_from_bytes(uploaded_bytes)
+    else:
+        df = core.load_data()
+
+    if core.TARGET not in df.columns:
+        raise ValueError(
+            f"El archivo de entrenamiento debe contener la columna objetivo '{core.TARGET}'. "
+            "Si subiste test.csv por error, súbelo en la pestaña de predicción por lote."
+        )
+    return df
+
+
+@st.cache_resource(show_spinner="Entrenando ensamble con validación cruzada...")
+def train_model(df: pd.DataFrame):
+    """Entrena LightGBM + XGBoost + CatBoost con la lógica de core.py."""
+    return core.fit_cv(df)
+
+
+def read_prediction_file(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(uploaded_file)
+    return pd.read_csv(uploaded_file, sep=None, engine="python")
+
+
+def probability_level(prob: float) -> tuple[str, str]:
+    if prob >= 0.66:
+        return "Alto", "🔴"
+    if prob >= 0.33:
+        return "Medio", "🟡"
+    return "Bajo", "🟢"
+
+
+# -----------------------------------------------------------------------------
+# Sidebar
+# -----------------------------------------------------------------------------
+st.sidebar.title("🔥 Incendios forestales")
+st.sidebar.caption("Versión web del modelo WiDS sin horizonte de 72h.")
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("Fuente de datos")
-
-uploaded = st.sidebar.file_uploader(
-    "Sube train.csv (opcional). Si no, se usa el incluido en data/.",
+train_file = st.sidebar.file_uploader(
+    "Sube train.csv opcionalmente",
     type=["csv", "txt"],
+    help="Si no subes un archivo, se usa data/train.csv incluido en el proyecto.",
 )
 
-# Boton util cuando cambias train.csv o haces pruebas.
-if st.sidebar.button("🔄 Reiniciar cache / reentrenar"):
+if st.sidebar.button("Limpiar caché y reentrenar"):
     st.cache_data.clear()
     st.cache_resource.clear()
     st.rerun()
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("Configuración del modelo")
+st.sidebar.write(f"**Horizontes:** {', '.join(str(h) + 'h' for h in core.HORIZONS)}")
+st.sidebar.write(f"**Pliegues CV:** {core.N_FOLDS}")
+st.sidebar.write(f"**Versión core:** {getattr(core, 'CORE_VERSION', 'sin versión')}")
+
+if 72 in core.HORIZONS:
+    st.sidebar.error("Advertencia: 72h sigue activo en core.HORIZONS.")
+else:
+    st.sidebar.success("72h excluido correctamente")
+
+# -----------------------------------------------------------------------------
+# Carga de datos y entrenamiento
+# -----------------------------------------------------------------------------
 try:
-    uploaded_bytes = uploaded.getvalue() if uploaded is not None else None
-    df = get_data(uploaded_bytes)
-except Exception as e:
-    st.error(
-        "No se pudo cargar el dataset de entrenamiento. Sube train.csv en la "
-        f"barra lateral. Detalle: {e}"
-    )
+    uploaded_bytes = train_file.getvalue() if train_file is not None else None
+    train_raw = load_train_data(uploaded_bytes)
+except Exception as exc:
+    st.error(f"No se pudo cargar el dataset de entrenamiento: {exc}")
     st.stop()
 
 try:
-    pipelines, metrics_df, best_model_name, medians, present_features, test_data = get_models(df)
-    X_test, y_test = test_data
-    best_pipeline = pipelines[best_model_name]
-except Exception as e:
-    st.error(f"No se pudo entrenar el modelo. Detalle: {e}")
+    bundle = train_model(train_raw)
+    metrics = bundle["metrics"]
+except Exception as exc:
+    st.error("No se pudo entrenar el modelo.")
+    st.exception(exc)
     st.stop()
 
+train_fe = bundle["train_fe"]
 
-tab_a, tab_b = st.tabs(
-    ["📊 Panel A - Analisis de Datos", "🔮 Panel B - Analisis Predictivo"]
+# -----------------------------------------------------------------------------
+# Encabezado
+# -----------------------------------------------------------------------------
+st.title("🔥 Predicción de amenaza de incendios forestales")
+st.markdown(
+    "Sistema inteligente de apoyo a la toma de decisiones que estima la "
+    "probabilidad de que un incendio amenace una zona de evacuación en "
+    "**12h, 24h y 48h**. El horizonte de **72h fue retirado** del análisis final."
 )
 
+kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+kpi1.metric("Registros de entrenamiento", f"{len(train_raw):,}")
+kpi2.metric("Incendios con evento", f"{int(train_raw[core.TARGET].sum()):,}")
+kpi3.metric("Puntaje híbrido", f"{metrics['hybrid']:.4f}")
+kpi4.metric("Brier ponderado", f"{metrics['weighted_brier']:.4f}")
 
-# ===========================================================================
-# PANEL A - ANALISIS DE DATOS
-# ===========================================================================
-with tab_a:
-    st.header("📊 Panel A - Analisis de Datos")
-    st.caption("Explora el dataset de incendios forestales de forma interactiva.")
+# -----------------------------------------------------------------------------
+# Pestañas
+# -----------------------------------------------------------------------------
+tab_resumen, tab_eda, tab_individual, tab_lote, tab_tecnico = st.tabs(
+    [
+        "📌 Resumen del modelo",
+        "📊 Análisis de datos",
+        "🔮 Predicción individual",
+        "📁 Predicción por lote",
+        "⚙️ Detalle técnico",
+    ]
+)
 
-    has_time = core.TIME_COL in df.columns
+# -----------------------------------------------------------------------------
+# Resumen del modelo
+# -----------------------------------------------------------------------------
+with tab_resumen:
+    st.header("📌 Resumen del modelo")
+    st.write(
+        "El modelo usa un ensamble de **LightGBM + XGBoost + CatBoost** con "
+        "validación cruzada estratificada de 5 pliegues. La métrica principal "
+        "combina **C-Index** y **Brier Score ponderado**, considerando solo 24h y 48h "
+        "para la evaluación principal."
+    )
 
-    with st.sidebar:
-        st.markdown("---")
-        st.subheader("Filtros - Panel A")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Puntaje híbrido", f"{metrics['hybrid']:.4f}")
+    c2.metric("C-Index", f"{metrics['c_index']:.4f}")
+    c3.metric("Brier ponderado", f"{metrics['weighted_brier']:.4f}")
 
-        diag_opt = st.selectbox(
-            "Resultado",
-            ["Todos", core.LABELS_TARGET[1], core.LABELS_TARGET[0]],
-        )
+    st.subheader("Resultados por pliegue")
+    fold_df = pd.DataFrame({
+        "Pliegue": [f"Fold {i + 1}" for i in range(len(metrics["fold_scores"]))],
+        "Puntaje híbrido": metrics["fold_scores"],
+    })
+    fig_folds = px.bar(
+        fold_df,
+        x="Pliegue",
+        y="Puntaje híbrido",
+        text="Puntaje híbrido",
+        title="Puntaje híbrido por pliegue de validación cruzada",
+    )
+    fig_folds.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+    fig_folds.update_yaxes(range=[0, 1])
+    st.plotly_chart(fig_folds, use_container_width=True)
 
-        if "area_first_ha" not in df.columns:
-            st.error("El dataset no contiene la columna area_first_ha.")
-            st.stop()
+    st.subheader("Brier Score por horizonte")
+    brier_rows = []
+    for h in core.HORIZONS:
+        key = f"brier_{h}h"
+        if key in metrics:
+            brier_rows.append({"Horizonte": f"{h}h", "Brier Score": metrics[key]})
+    brier_df = pd.DataFrame(brier_rows)
+    st.dataframe(brier_df, use_container_width=True, hide_index=True)
 
-        area_min = float(df["area_first_ha"].min())
-        area_max = float(df["area_first_ha"].max())
-        rango_area = st.slider(
-            "Area inicial (ha)",
-            area_min,
-            area_max,
-            (area_min, area_max),
-        )
+# -----------------------------------------------------------------------------
+# EDA
+# -----------------------------------------------------------------------------
+with tab_eda:
+    st.header("📊 Análisis exploratorio de datos")
 
-        if has_time:
-            t = df[core.TIME_COL].dropna()
-            t_min, t_max = float(t.min()), float(t.max())
-            rango_t = st.slider(
-                "Tiempo hasta impacto (horas)",
-                t_min,
-                t_max,
-                (t_min, t_max),
-            )
-
-    df_f = df[
-        (df["area_first_ha"] >= rango_area[0])
-        & (df["area_first_ha"] <= rango_area[1])
-    ].copy()
-
-    if diag_opt != "Todos":
-        cod = 1 if diag_opt == core.LABELS_TARGET[1] else 0
-        df_f = df_f[df_f[core.TARGET] == cod]
-
-    if has_time:
-        df_f = df_f[
-            (df_f[core.TIME_COL] >= rango_t[0])
-            & (df_f[core.TIME_COL] <= rango_t[1])
-        ]
-
-    if len(df_f) == 0:
-        st.warning("No hay registros que cumplan con los filtros seleccionados.")
-        st.stop()
-
-    df_plot = df_f.copy()
+    df_plot = train_raw.copy()
     df_plot["Resultado"] = df_plot[core.TARGET].map(core.LABELS_TARGET)
 
-    # --- KPIs ---
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Registros filtrados", f"{len(df_f)} / {len(df)}")
-    c2.metric("% que alcanzo la zona", f"{(df_f[core.TARGET].mean() * 100):.1f}%")
-
-    if has_time:
-        hit_times = df_f.loc[df_f[core.TARGET] == 1, core.TIME_COL]
-        prom = hit_times.mean() if len(hit_times) else float("nan")
-        c3.metric("Tiempo prom. hasta impacto", f"{prom:.1f} h" if prom == prom else "-")
-    else:
-        c3.metric("Area inicial promedio", f"{df_f['area_first_ha'].mean():.1f} ha")
-
-    st.markdown("---")
-
     g1, g2 = st.columns(2)
-
     with g1:
-        x_var = core.TIME_COL if has_time else "area_first_ha"
-        x_lab = "Tiempo hasta impacto (h)" if has_time else "Area inicial (ha)"
-        fig1 = px.histogram(
-            df_plot,
-            x=x_var,
-            color="Resultado",
-            nbins=20,
-            barmode="overlay",
-            title=f"Distribucion de {x_lab.lower()} por resultado",
-            labels={x_var: x_lab},
-            color_discrete_map=COLOR_MAP,
-        )
-        st.plotly_chart(fig1, use_container_width=True)
-
-    with g2:
-        if {"dist_min_ci_0_5h", "closing_speed_m_per_h"}.issubset(df_plot.columns):
-            fig2 = px.scatter(
-                df_plot,
-                x="dist_min_ci_0_5h",
-                y="closing_speed_m_per_h",
-                color="Resultado",
-                title="Distancia a la zona vs. velocidad de acercamiento",
-                labels={
-                    "dist_min_ci_0_5h": "Distancia minima a la zona (m)",
-                    "closing_speed_m_per_h": "Velocidad de acercamiento (m/h)",
-                },
-                color_discrete_map=COLOR_MAP,
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("No hay columnas suficientes para el grafico de dispersion.")
-
-    g3, g4 = st.columns(2)
-
-    with g3:
         counts = df_plot["Resultado"].value_counts().reset_index()
         counts.columns = ["Resultado", "Casos"]
-        fig3 = px.bar(
+        fig_counts = px.bar(
             counts,
             x="Resultado",
             y="Casos",
             color="Resultado",
-            title="Distribucion de la variable objetivo",
             color_discrete_map=COLOR_MAP,
+            title="Distribución de la variable objetivo",
         )
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig_counts, use_container_width=True)
+
+    with g2:
+        fig_time = px.histogram(
+            df_plot,
+            x=core.TIME_COL,
+            color="Resultado",
+            nbins=25,
+            barmode="overlay",
+            color_discrete_map=COLOR_MAP,
+            title="Distribución del tiempo hasta impacto",
+            labels={core.TIME_COL: "Tiempo hasta impacto (horas)"},
+        )
+        st.plotly_chart(fig_time, use_container_width=True)
+
+    g3, g4 = st.columns(2)
+    with g3:
+        fig_scatter = px.scatter(
+            df_plot,
+            x="dist_min_ci_0_5h",
+            y="closing_speed_m_per_h",
+            color="Resultado",
+            color_discrete_map=COLOR_MAP,
+            title="Distancia mínima vs. velocidad de acercamiento",
+            labels={
+                "dist_min_ci_0_5h": "Distancia mínima a zona (m)",
+                "closing_speed_m_per_h": "Velocidad de acercamiento (m/h)",
+            },
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
 
     with g4:
-        top_feats = [
-            "area_first_ha",
-            "area_growth_rate_ha_per_h",
-            "radial_growth_rate_m_per_h",
-            "dist_min_ci_0_5h",
-            "closing_speed_m_per_h",
-            "centroid_speed_m_per_h",
-            "alignment_cos",
-        ]
-        top_feats = [c for c in top_feats if c in df_f.columns]
+        fig_area = px.box(
+            df_plot,
+            x="Resultado",
+            y="area_first_ha",
+            color="Resultado",
+            color_discrete_map=COLOR_MAP,
+            title="Área inicial por resultado",
+            labels={"area_first_ha": "Área inicial (ha)"},
+        )
+        st.plotly_chart(fig_area, use_container_width=True)
 
-        if len(top_feats) >= 2:
-            corr = df_f[top_feats + [core.TARGET]].corr(numeric_only=True)
-            fig4 = px.imshow(
-                corr,
-                text_auto=".2f",
-                color_continuous_scale="RdBu_r",
-                zmin=-1,
-                zmax=1,
-                title="Correlaciones entre caracteristicas clave y el objetivo",
-            )
-            st.plotly_chart(fig4, use_container_width=True)
-        else:
-            st.info("No hay columnas suficientes para calcular correlaciones.")
+    st.subheader("Correlación de variables con el evento")
+    numeric_cols = train_fe.select_dtypes(include=[np.number]).columns.tolist()
+    corr = train_fe[numeric_cols].corr(numeric_only=True)[core.TARGET].drop(core.TARGET)
+    corr_df = corr.abs().sort_values(ascending=False).head(15).reset_index()
+    corr_df.columns = ["Característica", "Correlación absoluta con evento"]
+    fig_corr = px.bar(
+        corr_df.iloc[::-1],
+        x="Correlación absoluta con evento",
+        y="Característica",
+        orientation="h",
+        title="Top 15 variables más asociadas al evento",
+    )
+    st.plotly_chart(fig_corr, use_container_width=True)
 
-    with st.expander("Ver tabla de datos filtrados"):
-        st.dataframe(df_f, use_container_width=True)
+    with st.expander("Ver tabla de entrenamiento"):
+        st.dataframe(train_raw, use_container_width=True)
 
-
-# ===========================================================================
-# PANEL B - ANALISIS PREDICTIVO
-# ===========================================================================
-with tab_b:
-    st.header("🔮 Panel B - Analisis Predictivo")
-
-    best_f1 = metrics_df.set_index("Modelo").loc[best_model_name, "F1-Score"]
-    st.caption(
-        f"Modelo activo: **{best_model_name}** "
-        f"(F1-Score = {best_f1:.3f} en el conjunto de prueba)"
+# -----------------------------------------------------------------------------
+# Predicción individual
+# -----------------------------------------------------------------------------
+with tab_individual:
+    st.header("🔮 Predicción individual")
+    st.write(
+        "Ingresa las características principales del incendio. Las demás variables se "
+        "completan con la mediana del conjunto de entrenamiento y luego se recalculan "
+        "las variables derivadas."
     )
 
-    modo = st.radio(
-        "Modo de prediccion",
-        ["Caso individual (formulario)", "Por lote (subir archivo)"],
-        horizontal=True,
-    )
+    with st.form("individual_form"):
+        values = {}
+        cols = st.columns(2)
+        for i, (feat, label) in enumerate(core.FORM_FEATURES):
+            serie = pd.to_numeric(train_raw[feat], errors="coerce").dropna()
+            lo = float(serie.min())
+            hi = float(serie.max())
+            med = float(serie.median())
 
-    # -----------------------------------------------------------------------
-    # Caso individual
-    # -----------------------------------------------------------------------
-    if modo == "Caso individual (formulario)":
-        with st.form("formulario_prediccion"):
-            st.subheader("Ingresa las caracteristicas del incendio")
-            st.caption(
-                "Ahora el formulario incluye mas variables y recalcula variables "
-                "derivadas para que los resultados tengan mayor variacion."
-            )
+            if feat in ["num_perimeters_0_5h", "event_start_hour"]:
+                step = 1.0
+            elif feat == "alignment_abs":
+                step = 0.01
+                lo, hi = max(0.0, lo), min(1.0, hi)
+            else:
+                step = float((hi - lo) / 200) if hi > lo else 0.01
+                step = max(step, 0.01)
 
-            form_values = {}
-            cols = st.columns(2)
+            with cols[i % 2]:
+                values[feat] = st.slider(
+                    label,
+                    min_value=lo,
+                    max_value=hi,
+                    value=min(max(med, lo), hi),
+                    step=step,
+                )
 
-            for i, (feat, label) in enumerate(core.FORM_FEATURES):
-                if feat not in df.columns or feat not in present_features:
-                    continue
+        submitted = st.form_submit_button("Calcular probabilidad", use_container_width=True)
 
-                serie = pd.to_numeric(df[feat], errors="coerce").dropna()
-                if serie.empty:
-                    continue
-
-                lo = float(serie.min())
-                hi = float(serie.max())
-                med = float(serie.median())
-
-                # Para columnas casi binarias o enteras pequenas se usa paso 1.
-                unique_count = serie.nunique()
-                is_integer_like = (serie.dropna() % 1 == 0).all()
-
-                if is_integer_like and unique_count <= 30:
-                    step = 1.0
-                else:
-                    step = (hi - lo) / 200 if hi > lo else 0.1
-
-                with cols[i % 2]:
-                    form_values[feat] = st.slider(
-                        label,
-                        min_value=lo,
-                        max_value=hi,
-                        value=med,
-                        step=step,
-                    )
-
-            submitted = st.form_submit_button("🔍 Predecir", use_container_width=True)
-
-        if submitted:
-            pred, prob_pos, prob_neg = core.predict_single(
-                best_pipeline,
-                form_values,
-                medians,
-                present_features,
-            )
+    if submitted:
+        try:
+            probs_dict, model_row = core.predict_single(bundle, values)
+            prob48 = probs_dict.get(48, list(probs_dict.values())[-1])
+            level, icon = probability_level(prob48)
 
             st.markdown("---")
-            r1, r2 = st.columns([1, 1])
+            st.subheader(f"{icon} Nivel de riesgo estimado: {level}")
 
-            with r1:
-                if pred == 1:
-                    st.error(f"### ⚠️ {core.LABELS_TARGET[1]}")
-                    st.progress(prob_pos)
-                    st.metric("Probabilidad de alcanzar la zona", f"{prob_pos * 100:.1f}%")
-                else:
-                    st.success(f"### ✅ {core.LABELS_TARGET[0]}")
-                    st.progress(prob_neg)
-                    st.metric("Probabilidad de NO alcanzar la zona", f"{prob_neg * 100:.1f}%")
+            cols_prob = st.columns(len(core.HORIZONS))
+            for col, h in zip(cols_prob, core.HORIZONS):
+                col.metric(f"Probabilidad {h}h", f"{probs_dict[h] * 100:.1f}%")
 
-            with r2:
-                st.info(
-                    "**Como interpretar este resultado**\n\n"
-                    + (
-                        "Segun las caracteristicas ingresadas, el modelo estima "
-                        "un patron similar al de incendios que SI alcanzaron una "
-                        "zona de evacuacion. Es una estimacion estadistica de apoyo "
-                        "a la decision, no una prediccion definitiva."
-                        if pred == 1
-                        else
-                        "Segun las caracteristicas ingresadas, el modelo estima "
-                        "un patron mas similar al de incendios que NO alcanzaron "
-                        "una zona de evacuacion. Esto no elimina el riesgo, porque "
-                        "las condiciones pueden cambiar."
-                    )
-                )
-
-            with st.expander("Ver valores usados en la prediccion"):
-                st.dataframe(pd.DataFrame([form_values]), use_container_width=True)
-
-    # -----------------------------------------------------------------------
-    # Prediccion por lote
-    # -----------------------------------------------------------------------
-    else:
-        st.subheader("Prediccion por lote")
-        st.caption(
-            "Sube un archivo con el mismo formato que test.csv. Puede tener event_id "
-            "y las caracteristicas del incendio, pero no necesita la columna event."
-        )
-
-        pred_file = st.file_uploader(
-            "Archivo de casos a predecir",
-            type=["csv", "txt", "xlsx"],
-            key="batch",
-        )
-
-        if pred_file is not None:
-            try:
-                df_new = core.read_prediction_file(pred_file)
-                resultado = core.predict_batch(
-                    best_pipeline,
-                    df_new,
-                    medians,
-                    present_features,
-                )
-
-                st.success(f"Se generaron predicciones para {len(resultado)} incendios.")
-
-                k1, k2 = st.columns(2)
-                k1.metric("En riesgo (prediccion = 1)", int(resultado["prediccion"].sum()))
-                k2.metric(
-                    "Prob. promedio de alcanzar zona",
-                    f"{resultado['prob_alcanza_zona'].mean() * 100:.1f}%",
-                )
-
-                st.dataframe(resultado, use_container_width=True)
-
-                st.download_button(
-                    "⬇️ Descargar predicciones (CSV)",
-                    resultado.to_csv(index=False).encode("utf-8"),
-                    file_name="predicciones.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-
-            except Exception as e:
-                st.error(f"No se pudo procesar el archivo. Detalle: {e}")
-
-    # -----------------------------------------------------------------------
-    # Comparacion de modelos e importancia
-    # -----------------------------------------------------------------------
-    with st.expander("📈 Ver comparacion de los 5 modelos entrenados"):
-        st.dataframe(
-            metrics_df.style.format({
-                "Accuracy": "{:.4f}",
-                "F1-Score": "{:.4f}",
-                "Precision": "{:.4f}",
-                "Recall": "{:.4f}",
-                "ROC-AUC": "{:.4f}",
-            }),
-            use_container_width=True,
-        )
-
-        st.caption(
-            f"Se selecciono **{best_model_name}** como modelo final por su mayor "
-            "F1-Score en el conjunto de prueba. Los modelos usan class_weight "
-            "balanceado cuando el algoritmo lo permite. Se mantiene excluida "
-            "la variable 'dist_min_ci_0_5h' por posible fuga de datos; por eso "
-            "puede aparecer en graficos, pero no en el entrenamiento."
-        )
-
-    imp = core.feature_importance(best_pipeline, present_features)
-    if imp is not None:
-        with st.expander("🌲 Ver importancia de caracteristicas del modelo final"):
-            fig_imp = px.bar(
-                imp.head(15).iloc[::-1],
-                x="Importancia",
-                y="Caracteristica",
-                orientation="h",
-                title="Top 15 caracteristicas mas influyentes",
+            prob_df = pd.DataFrame({
+                "Horizonte": [f"{h}h" for h in core.HORIZONS],
+                "Probabilidad": [probs_dict[h] for h in core.HORIZONS],
+            })
+            fig_prob = px.line(
+                prob_df,
+                x="Horizonte",
+                y="Probabilidad",
+                markers=True,
+                title="Evolución de la probabilidad por horizonte",
             )
-            st.plotly_chart(fig_imp, use_container_width=True)
+            fig_prob.update_yaxes(range=[0, 1], tickformat=".0%")
+            st.plotly_chart(fig_prob, use_container_width=True)
 
+            st.info(
+                "Interpretación: el resultado es una estimación probabilística de apoyo "
+                "a la decisión. No reemplaza la evaluación de especialistas ni información "
+                "operativa en tiempo real."
+            )
+
+            with st.expander("Ver fila enviada al modelo"):
+                st.dataframe(model_row, use_container_width=True)
+        except Exception as exc:
+            st.error(f"No se pudo calcular la predicción: {exc}")
+
+# -----------------------------------------------------------------------------
+# Predicción por lote
+# -----------------------------------------------------------------------------
+with tab_lote:
+    st.header("📁 Predicción por lote")
+    st.write(
+        "Sube un archivo con formato similar a `test.csv`. Debe contener las "
+        "variables de entrada del incendio, pero no necesita la columna `event`."
+    )
+
+    batch_file = st.file_uploader(
+        "Archivo para predecir",
+        type=["csv", "txt", "xlsx"],
+        key="batch_file",
+    )
+
+    use_sample = st.checkbox("Usar data/test.csv incluido como ejemplo", value=batch_file is None)
+
+    df_new = None
+    try:
+        if batch_file is not None:
+            df_new = read_prediction_file(batch_file)
+        elif use_sample and Path("data/test.csv").exists():
+            df_new = pd.read_csv("data/test.csv")
+    except Exception as exc:
+        st.error(f"No se pudo leer el archivo de predicción: {exc}")
+
+    if df_new is not None:
+        try:
+            result = core.predict_batch(bundle, df_new)
+            result = result.drop(columns=["prob_72h"], errors="ignore")
+
+            st.success(f"Predicciones generadas para {len(result):,} registros.")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Promedio 12h", f"{result['prob_12h'].mean() * 100:.1f}%")
+            c2.metric("Promedio 24h", f"{result['prob_24h'].mean() * 100:.1f}%")
+            c3.metric("Promedio 48h", f"{result['prob_48h'].mean() * 100:.1f}%")
+
+            st.dataframe(result, use_container_width=True)
+
+            csv_bytes = result.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Descargar predicciones.csv",
+                data=csv_bytes,
+                file_name="predicciones.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+            fig_dist = px.histogram(
+                result,
+                x="prob_48h",
+                nbins=20,
+                title="Distribución de probabilidades a 48h",
+                labels={"prob_48h": "Probabilidad 48h"},
+            )
+            fig_dist.update_xaxes(tickformat=".0%")
+            st.plotly_chart(fig_dist, use_container_width=True)
+
+        except Exception as exc:
+            st.error("No se pudieron generar predicciones. Verifica que el archivo tenga las columnas necesarias.")
+            st.exception(exc)
+    else:
+        st.info("Sube un archivo o activa el uso de `data/test.csv` incluido.")
+
+# -----------------------------------------------------------------------------
+# Detalle técnico
+# -----------------------------------------------------------------------------
+with tab_tecnico:
+    st.header("⚙️ Detalle técnico")
+
+    st.subheader("Horizontes considerados")
+    st.code(f"core.HORIZONS = {core.HORIZONS}")
+    st.write("El horizonte de 72h no se entrena, no se evalúa y no aparece en el CSV final.")
+
+    st.subheader("Validez y positivos por horizonte")
+    horizon_df = pd.DataFrame({
+        "Horizonte": [f"{h}h" for h in core.HORIZONS],
+        "Casos válidos": [metrics["horizon_valid"].get(h, 0) for h in core.HORIZONS],
+        "Casos positivos": [metrics["horizon_pos"].get(h, 0) for h in core.HORIZONS],
+    })
+    st.dataframe(horizon_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Variables derivadas principales")
+    derived = pd.DataFrame({
+        "Variable": [
+            "time_to_contact",
+            "log_time_to_contact",
+            "danger_vector",
+            "tracking_urgency",
+            "fire_intensity",
+            "approach_momentum",
+            "log_dist",
+            "dist_zone_critical",
+            "dist_zone_mid",
+            "speed_per_km",
+        ],
+        "Descripción": [
+            "Tiempo estimado para contactar la zona según distancia y velocidad.",
+            "Transformación logarítmica del tiempo de contacto.",
+            "Combinación entre alineación del avance y velocidad de acercamiento.",
+            "Urgencia de seguimiento según número de perímetros y velocidad.",
+            "Intensidad aproximada del crecimiento del incendio.",
+            "Momentum del avance hacia la zona ajustado por distancia.",
+            "Distancia mínima transformada con logaritmo.",
+            "Indicador de distancia crítica menor a 5 km.",
+            "Indicador de distancia media entre 5 km y 15 km.",
+            "Velocidad normalizada por kilómetro de distancia.",
+        ],
+    })
+    st.dataframe(derived, use_container_width=True, hide_index=True)
+
+    st.subheader("Columnas usadas por el modelo")
+    st.write(f"Total de características: {len(bundle['feature_cols'])}")
+    st.code("\n".join(bundle["feature_cols"]))
 
 st.markdown("---")
 st.caption(
-    "Dashboard desarrollado con Streamlit - Proyecto de prediccion de amenaza de "
-    "incendios forestales - GrupoSixpack (uso academico)"
+    "Dashboard académico desarrollado con Streamlit. Modelo probabilístico para apoyo a la toma de decisiones; "
+    "no reemplaza evaluación técnica especializada ni datos operativos en tiempo real."
 )
