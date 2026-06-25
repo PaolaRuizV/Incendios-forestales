@@ -138,7 +138,7 @@ st.title("🔥 Predicción de amenaza de incendios forestales")
 st.markdown(
     "Sistema inteligente de apoyo a la toma de decisiones que estima la "
     "probabilidad de que un incendio amenace una zona de evacuación en "
-    "**12h, 24h y 48h**. El horizonte de **72h fue retirado** del análisis final."
+    "**12h, 24h y 48h**.
 )
 
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -168,8 +168,7 @@ with tab_resumen:
     st.write(
         "El modelo usa un ensamble de **LightGBM + XGBoost + CatBoost** con "
         "validación cruzada estratificada de 5 pliegues. La métrica principal "
-        "combina **C-Index** y **Brier Score ponderado**, considerando solo 24h y 48h "
-        "para la evaluación principal."
+        "combina **C-Index** y **Brier Score ponderado**"
     )
 
     c1, c2, c3 = st.columns(3)
